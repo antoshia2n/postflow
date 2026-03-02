@@ -1,9 +1,4 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import {
-  getUserId, fetchWorkspaces, upsertWorkspace,
-  deleteWorkspace as sbDeleteWorkspace,
-  fetchWsData, saveWsData
-} from "./supabase.js";
 
 // ─── Tokens ───────────────────────────────────────────────────────────────────
 const C = {
@@ -637,10 +632,15 @@ const ItemModal = ({ item, folders, defFolderId, links, onSave, onClose }) => {
   const tc     = isPost ? POST_TYPE[form.type] : null;
   const accent = tc?.color || kc;
 
+  // ドラッグ誤クローズ防止
+  const mouseDownOnOverlay = useRef(false);
+
   const addTag = () => { const t=tagIn.trim(); if(t&&!form.tags.includes(t)) set("tags",[...form.tags,t]); setTagIn(""); };
   const save = () => {
-    if(!form.title.trim()||!form.content.trim()) return;
-    onSave({...form, id:form.id||uid(), createdAt:form.createdAt||today()});
+    if(!form.content.trim()) return;
+    // タイトルが空なら本文1行目、それもなければ「無題」
+    const autoTitle = form.title.trim() || form.content.trim().split("\n")[0].slice(0,40) || "無題";
+    onSave({...form, title:autoTitle, id:form.id||uid(), createdAt:form.createdAt||today()});
     onClose();
   };
 
@@ -648,7 +648,8 @@ const ItemModal = ({ item, folders, defFolderId, links, onSave, onClose }) => {
 
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(10,9,8,0.45)", backdropFilter:"blur(6px)", display:"flex", alignItems:"flex-start", justifyContent:"center", zIndex:1000, padding:"28px 20px", overflowY:"auto" }}
-      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      onMouseDown={e=>{ mouseDownOnOverlay.current = (e.target===e.currentTarget); }}
+      onClick={e=>{ if(e.target===e.currentTarget && mouseDownOnOverlay.current) onClose(); mouseDownOnOverlay.current=false; }}>
       <div style={{ background:C.panel, border:`1px solid ${C.border}`, borderTop:`3px solid ${accent}`, borderRadius:14, width:"100%", maxWidth:600, boxShadow:"0 32px 80px rgba(0,0,0,0.14)" }}>
         <div style={{ padding:"16px 20px 0", display:"flex", alignItems:"center" }}>
           <Dot color={accent} size={8}/>
@@ -768,7 +769,8 @@ const ImportModal = ({ folders, defFolderId, onImport, onClose }) => {
 
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(10,9,8,0.45)", backdropFilter:"blur(6px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000, padding:24 }}
-      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      onMouseDown={e=>{ if(e.target===e.currentTarget) e.currentTarget._md=true; }}
+      onClick={e=>{ if(e.target===e.currentTarget&&e.currentTarget._md) onClose(); e.currentTarget._md=false; }}>
       <div style={{ background:C.panel, border:`1px solid ${C.border}`, borderRadius:14, width:"100%", maxWidth:520, boxShadow:"0 32px 80px rgba(0,0,0,0.14)", maxHeight:"82vh", display:"flex", flexDirection:"column" }}>
         <div style={{ padding:"15px 18px 12px", borderBottom:`1px solid ${C.border}`, display:"flex", alignItems:"center", gap:8 }}>
           <Ic n="import" s={16}/><span style={{ fontWeight:800, fontSize:14, color:C.text }}>テキストを取り込む</span>
@@ -1114,6 +1116,22 @@ const MobileCompose = ({ folders, defFolderId, links, onSave, onClose, defaultKi
   );
 };
 
+// ─── CopyUserIdBtn ────────────────────────────────────────────────────────────
+const CopyUserIdBtn = () => {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    const id = localStorage.getItem("pf_uid") || "（IDが見つかりません）";
+    navigator.clipboard.writeText(id);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+  return (
+    <GhostBtn small onClick={copy} style={{ border:"1px solid #2E2E32", color:copied?"#5A9":"#777", fontSize:11.5 }}>
+      <Ic n={copied?"check":"copy"} s={12}/>{copied?"IDコピー済":"拡張機能用ID"}
+    </GhostBtn>
+  );
+};
+
 // ─── Mobile Layout ────────────────────────────────────────────────────────────
 const MobileLayout = ({ workspaces, activeWsId, items, folders, links, onSwitchWs, onAddWs, onRenameWs, onDeleteWs, onSaveItem, onDeleteItem, onRankItem, onStatusItem, onMoveItem, onAddFolder, onRenameFolder, onDeleteFolder, onImportItem, onAddLink, onDeleteLink, onEditLink }) => {
   const [tab,      setTab]      = useState("home");  // home | folders | search
@@ -1341,10 +1359,9 @@ const MobileLayout = ({ workspaces, activeWsId, items, folders, links, onSwitchW
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [workspaces, setWorkspaces] = useState(null);
+  const [workspaces, setWorkspaces] = useState(null); // null = loading
   const [activeWsId, setActiveWsId] = useState(null);
-  const [wsData,     setWsData]     = useState({});
-  const [loading,    setLoading]    = useState(true);
+  const [wsData,     setWsData]     = useState({});   // { [wsId]: {items, folders, links} }
 
   const [selF,     setSelF]     = useState("__all__");
   const [selItem,  setSelItem]  = useState(null);
@@ -1356,61 +1373,53 @@ export default function App() {
   const [showImp,  setShowImp]  = useState(false);
   const [sort,     setSort]     = useState("date");
 
-  const userId = useRef(getUserId());
-  const saveTimer = useRef({});
-
-  // ── Supabase: save with debounce (500ms) ──
-  const scheduleSave = useCallback((wsId, patch) => {
-    if(saveTimer.current[wsId]) clearTimeout(saveTimer.current[wsId]);
-    saveTimer.current[wsId] = setTimeout(() => {
-      saveWsData(wsId, userId.current, patch).catch(console.error);
-    }, 500);
-  }, []);
-
   // ── Bootstrap ──
-  useEffect(() => {
-    (async () => {
+  useEffect(()=>{
+    (async()=>{
       try {
-        const uid = userId.current;
-        let wsList = await fetchWorkspaces(uid);
-
-        if (!wsList || wsList.length === 0) {
-          // 初回：デフォルトワークスペースを作成
-          const init = makeDefaultWorkspaces();
-          wsList = init.workspaces;
-          for (const ws of wsList) {
-            await upsertWorkspace(ws, uid);
-            await saveWsData(ws.id, uid, init.data[ws.id]);
-          }
-        }
-
-        setWorkspaces(wsList);
-        const awId = localStorage.getItem("pf_activeWs") || wsList[0].id;
-        setActiveWsId(awId);
-
-        // アクティブWSのデータをロード
-        const data = {};
-        for (const ws of wsList) {
-          const d = await fetchWsData(ws.id, uid);
-          if (d) {
-            data[ws.id] = { items: d.items||[], folders: d.folders||[], links: d.links||[] };
-          } else {
+        const rwl = await window.storage?.get("pf7_workspaces");
+        const raw = await window.storage?.get("pf7_activeWs");
+        if(rwl?.value) {
+          const wsList = JSON.parse(rwl.value);
+          const awId   = raw?.value || wsList[0].id;
+          setWorkspaces(wsList);
+          setActiveWsId(awId);
+          // Load all workspace data
+          const data = {};
+          for(const ws of wsList) {
+            const ri = await window.storage?.get(`pf7i_${ws.id}`);
+            const rf = await window.storage?.get(`pf7f_${ws.id}`);
+            const rl = await window.storage?.get(`pf7l_${ws.id}`);
             const def = makeInitFolders();
-            data[ws.id] = { items: makeInitItems(def), folders: def, links: [] };
+            data[ws.id] = {
+              items:   ri?.value ? JSON.parse(ri.value) : makeInitItems(def),
+              folders: rf?.value ? JSON.parse(rf.value) : def,
+              links:   rl?.value ? JSON.parse(rl.value) : [],
+            };
+          }
+          setWsData(data);
+        } else {
+          // First run
+          const init = makeDefaultWorkspaces();
+          setWorkspaces(init.workspaces);
+          setActiveWsId(init.workspaces[0].id);
+          setWsData(init.data);
+          window.storage?.set("pf7_workspaces", JSON.stringify(init.workspaces));
+          window.storage?.set("pf7_activeWs",   init.workspaces[0].id);
+          for(const ws of init.workspaces) {
+            window.storage?.set(`pf7i_${ws.id}`, JSON.stringify(init.data[ws.id].items));
+            window.storage?.set(`pf7f_${ws.id}`, JSON.stringify(init.data[ws.id].folders));
+            window.storage?.set(`pf7l_${ws.id}`, JSON.stringify(init.data[ws.id].links));
           }
         }
-        setWsData(data);
-      } catch (e) {
-        console.error("Bootstrap error:", e);
+      } catch(e) {
         const init = makeDefaultWorkspaces();
         setWorkspaces(init.workspaces);
         setActiveWsId(init.workspaces[0].id);
         setWsData(init.data);
-      } finally {
-        setLoading(false);
       }
     })();
-  }, []);
+  },[]);
 
   // ── Workspace data accessors ──
   const curWs  = wsData[activeWsId] || { items:[], folders:[], links:[] };
@@ -1418,60 +1427,66 @@ export default function App() {
   const folders = curWs.folders;
   const links   = curWs.links;
 
-  const patchWs = useCallback((wsId, patch) => {
+  const patchWs = (wsId, patch) => {
     setWsData(prev => {
-      const next = { ...prev, [wsId]: { ...prev[wsId], ...patch } };
-      scheduleSave(wsId, { ...prev[wsId], ...patch });
+      const next = { ...prev, [wsId]:{ ...prev[wsId], ...patch } };
+      if(patch.items)   window.storage?.set(`pf7i_${wsId}`, JSON.stringify(patch.items)).catch(()=>{});
+      if(patch.folders) window.storage?.set(`pf7f_${wsId}`, JSON.stringify(patch.folders)).catch(()=>{});
+      if(patch.links)   window.storage?.set(`pf7l_${wsId}`, JSON.stringify(patch.links)).catch(()=>{});
       return next;
     });
-  }, [scheduleSave]);
+  };
 
   const si = i => patchWs(activeWsId, { items:i });
   const sf = f => patchWs(activeWsId, { folders:f });
   const sl = l => patchWs(activeWsId, { links:l });
 
-  // ── Workspace operations ──
+  // ── Workspace switching ──
   const switchWs = async (wsId) => {
     setActiveWsId(wsId);
     setSelF("__all__");
     setSelItem(null);
     setSearch("");
-    localStorage.setItem("pf_activeWs", wsId);
-    if (!wsData[wsId]) {
+    window.storage?.set("pf7_activeWs", wsId);
+    // Lazy-load if not yet fetched
+    if(!wsData[wsId]) {
       try {
-        const d = await fetchWsData(wsId, userId.current);
+        const ri = await window.storage?.get(`pf7i_${wsId}`);
+        const rf = await window.storage?.get(`pf7f_${wsId}`);
+        const rl = await window.storage?.get(`pf7l_${wsId}`);
         const def = makeInitFolders();
-        setWsData(prev => ({ ...prev, [wsId]: d
-          ? { items: d.items||[], folders: d.folders||[], links: d.links||[] }
-          : { items: makeInitItems(def), folders: def, links: [] }
-        }));
+        setWsData(prev=>({ ...prev, [wsId]:{
+          items:   ri?.value?JSON.parse(ri.value):makeInitItems(def),
+          folders: rf?.value?JSON.parse(rf.value):def,
+          links:   rl?.value?JSON.parse(rl.value):[],
+        }}));
       } catch {}
     }
   };
 
-  const addWorkspace = async (ws) => {
+  const addWorkspace = (ws) => {
     const newFolders = makeInitFolders();
-    const newData    = { items: makeInitItems(newFolders), folders: newFolders, links: [] };
     const newWsList  = [...(workspaces||[]), ws];
     setWorkspaces(newWsList);
-    setWsData(prev => ({ ...prev, [ws.id]: newData }));
-    await upsertWorkspace(ws, userId.current);
-    await saveWsData(ws.id, userId.current, newData);
+    setWsData(prev=>({ ...prev, [ws.id]:{ items:makeInitItems(newFolders), folders:newFolders, links:[] } }));
+    window.storage?.set("pf7_workspaces", JSON.stringify(newWsList));
+    window.storage?.set(`pf7i_${ws.id}`, JSON.stringify(makeInitItems(newFolders)));
+    window.storage?.set(`pf7f_${ws.id}`, JSON.stringify(newFolders));
+    window.storage?.set(`pf7l_${ws.id}`, JSON.stringify([]));
     switchWs(ws.id);
   };
 
-  const renameWorkspace = async (wsId, name) => {
-    const next = (workspaces||[]).map(w => w.id===wsId ? {...w, name} : w);
+  const renameWorkspace = (wsId, name) => {
+    const next = (workspaces||[]).map(w=>w.id===wsId?{...w,name}:w);
     setWorkspaces(next);
-    const ws = next.find(w => w.id===wsId);
-    if (ws) await upsertWorkspace(ws, userId.current);
+    window.storage?.set("pf7_workspaces", JSON.stringify(next));
   };
 
-  const deleteWorkspace = async (wsId) => {
-    const next = (workspaces||[]).filter(w => w.id!==wsId);
+  const deleteWorkspace = (wsId) => {
+    const next = (workspaces||[]).filter(w=>w.id!==wsId);
     setWorkspaces(next);
-    await sbDeleteWorkspace(wsId);
-    if (activeWsId===wsId && next.length>0) switchWs(next[0].id);
+    window.storage?.set("pf7_workspaces", JSON.stringify(next));
+    if(activeWsId===wsId && next.length>0) switchWs(next[0].id);
   };
 
   // ── Item operations ──
@@ -1515,10 +1530,9 @@ export default function App() {
 
   const isMobile = useIsMobile();
 
-  if(loading || !workspaces) return (
-    <div style={{ height:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:C.header, gap:14, fontFamily:"'Hiragino Sans',sans-serif" }}>
-      <div style={{ width:32, height:32, borderRadius:9, background:C.amber, display:"flex", alignItems:"center", justifyContent:"center" }}><Ic n="xLogo" s={16}/></div>
-      <div style={{ color:"#666", fontSize:13 }}>PostFlow を読み込み中…</div>
+  if(!workspaces) return (
+    <div style={{ height:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:C.header, color:"#666", fontSize:13, fontFamily:"'Hiragino Sans',sans-serif" }}>
+      読み込み中…
     </div>
   );
 
@@ -1576,6 +1590,7 @@ export default function App() {
           ))}
         </div>
         <GhostBtn small onClick={()=>setShowImp(true)} style={{ border:"1px solid #2E2E32", color:"#777", fontSize:11.5 }}><Ic n="import" s={12}/>取り込み</GhostBtn>
+        <CopyUserIdBtn/>
         <SolidBtn color={C.amber} small onClick={()=>setEditItem({})}><Ic n="plus" s={13}/>新規作成</SolidBtn>
       </header>
 
