@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { getUserId, fetchWorkspaces, fetchWsData, saveWsData, upsertWorkspace, deleteWorkspace as deleteWsFromDb } from "./supabase";
 
 // ─── Tokens ───────────────────────────────────────────────────────────────────
 const C = {
@@ -1373,46 +1374,42 @@ export default function App() {
   const [showImp,  setShowImp]  = useState(false);
   const [sort,     setSort]     = useState("date");
 
-  // ── Bootstrap ──
+  // ── Bootstrap (Supabase) ──
   useEffect(()=>{
     (async()=>{
       try {
-        const rwl = await window.storage?.get("pf7_workspaces");
-        const raw = await window.storage?.get("pf7_activeWs");
-        if(rwl?.value) {
-          const wsList = JSON.parse(rwl.value);
-          const awId   = raw?.value || wsList[0].id;
-          setWorkspaces(wsList);
-          setActiveWsId(awId);
-          // Load all workspace data
-          const data = {};
-          for(const ws of wsList) {
-            const ri = await window.storage?.get(`pf7i_${ws.id}`);
-            const rf = await window.storage?.get(`pf7f_${ws.id}`);
-            const rl = await window.storage?.get(`pf7l_${ws.id}`);
-            const def = makeInitFolders();
-            data[ws.id] = {
-              items:   ri?.value ? JSON.parse(ri.value) : makeInitItems(def),
-              folders: rf?.value ? JSON.parse(rf.value) : def,
-              links:   rl?.value ? JSON.parse(rl.value) : [],
-            };
-          }
-          setWsData(data);
-        } else {
-          // First run
+        const userId = getUserId();
+        let wsList = await fetchWorkspaces(userId);
+        if(!wsList || wsList.length===0) {
+          // 初回：デフォルトワークスペースを作成
           const init = makeDefaultWorkspaces();
-          setWorkspaces(init.workspaces);
-          setActiveWsId(init.workspaces[0].id);
-          setWsData(init.data);
-          window.storage?.set("pf7_workspaces", JSON.stringify(init.workspaces));
-          window.storage?.set("pf7_activeWs",   init.workspaces[0].id);
           for(const ws of init.workspaces) {
-            window.storage?.set(`pf7i_${ws.id}`, JSON.stringify(init.data[ws.id].items));
-            window.storage?.set(`pf7f_${ws.id}`, JSON.stringify(init.data[ws.id].folders));
-            window.storage?.set(`pf7l_${ws.id}`, JSON.stringify(init.data[ws.id].links));
+            await upsertWorkspace({...ws, sort_order: init.workspaces.indexOf(ws)}, userId);
+            await saveWsData(ws.id, userId, {
+              items:   init.data[ws.id].items,
+              folders: init.data[ws.id].folders,
+              links:   init.data[ws.id].links,
+            });
           }
+          wsList = await fetchWorkspaces(userId);
         }
+        setWorkspaces(wsList);
+        const awId = wsList[0].id;
+        setActiveWsId(awId);
+        // 全ワークスペースのデータを読み込む
+        const data = {};
+        for(const ws of wsList) {
+          const d = await fetchWsData(ws.id, userId);
+          const def = makeInitFolders();
+          data[ws.id] = {
+            items:   d?.items   || makeInitItems(def),
+            folders: d?.folders || def,
+            links:   d?.links   || [],
+          };
+        }
+        setWsData(data);
       } catch(e) {
+        console.error("Boot error:", e);
         const init = makeDefaultWorkspaces();
         setWorkspaces(init.workspaces);
         setActiveWsId(init.workspaces[0].id);
@@ -1430,9 +1427,14 @@ export default function App() {
   const patchWs = (wsId, patch) => {
     setWsData(prev => {
       const next = { ...prev, [wsId]:{ ...prev[wsId], ...patch } };
-      if(patch.items)   window.storage?.set(`pf7i_${wsId}`, JSON.stringify(patch.items)).catch(()=>{});
-      if(patch.folders) window.storage?.set(`pf7f_${wsId}`, JSON.stringify(patch.folders)).catch(()=>{});
-      if(patch.links)   window.storage?.set(`pf7l_${wsId}`, JSON.stringify(patch.links)).catch(()=>{});
+      // Supabaseに保存（デバウンスなしで即保存）
+      const userId = getUserId();
+      const merged = next[wsId];
+      saveWsData(wsId, userId, {
+        items:   merged.items,
+        folders: merged.folders,
+        links:   merged.links,
+      }).catch(e => console.error("Save error:", e));
       return next;
     });
   };
@@ -1447,45 +1449,44 @@ export default function App() {
     setSelF("__all__");
     setSelItem(null);
     setSearch("");
-    window.storage?.set("pf7_activeWs", wsId);
-    // Lazy-load if not yet fetched
     if(!wsData[wsId]) {
       try {
-        const ri = await window.storage?.get(`pf7i_${wsId}`);
-        const rf = await window.storage?.get(`pf7f_${wsId}`);
-        const rl = await window.storage?.get(`pf7l_${wsId}`);
+        const userId = getUserId();
+        const d = await fetchWsData(wsId, userId);
         const def = makeInitFolders();
         setWsData(prev=>({ ...prev, [wsId]:{
-          items:   ri?.value?JSON.parse(ri.value):makeInitItems(def),
-          folders: rf?.value?JSON.parse(rf.value):def,
-          links:   rl?.value?JSON.parse(rl.value):[],
+          items:   d?.items   || makeInitItems(def),
+          folders: d?.folders || def,
+          links:   d?.links   || [],
         }}));
-      } catch {}
+      } catch(e) { console.error("switchWs error:", e); }
     }
   };
 
-  const addWorkspace = (ws) => {
+  const addWorkspace = async (ws) => {
     const newFolders = makeInitFolders();
+    const newItems   = makeInitItems(newFolders);
     const newWsList  = [...(workspaces||[]), ws];
     setWorkspaces(newWsList);
-    setWsData(prev=>({ ...prev, [ws.id]:{ items:makeInitItems(newFolders), folders:newFolders, links:[] } }));
-    window.storage?.set("pf7_workspaces", JSON.stringify(newWsList));
-    window.storage?.set(`pf7i_${ws.id}`, JSON.stringify(makeInitItems(newFolders)));
-    window.storage?.set(`pf7f_${ws.id}`, JSON.stringify(newFolders));
-    window.storage?.set(`pf7l_${ws.id}`, JSON.stringify([]));
+    setWsData(prev=>({ ...prev, [ws.id]:{ items:newItems, folders:newFolders, links:[] } }));
+    const userId = getUserId();
+    await upsertWorkspace({...ws, sort_order:newWsList.length-1}, userId);
+    await saveWsData(ws.id, userId, { items:newItems, folders:newFolders, links:[] });
     switchWs(ws.id);
   };
 
   const renameWorkspace = (wsId, name) => {
     const next = (workspaces||[]).map(w=>w.id===wsId?{...w,name}:w);
     setWorkspaces(next);
-    window.storage?.set("pf7_workspaces", JSON.stringify(next));
+    const userId = getUserId();
+    const ws = next.find(w=>w.id===wsId);
+    if(ws) upsertWorkspace(ws, userId).catch(e=>console.error("rename error:",e));
   };
 
   const deleteWorkspace = (wsId) => {
     const next = (workspaces||[]).filter(w=>w.id!==wsId);
     setWorkspaces(next);
-    window.storage?.set("pf7_workspaces", JSON.stringify(next));
+    deleteWsFromDb(wsId).catch(e=>console.error("delete ws error:",e));
     if(activeWsId===wsId && next.length>0) switchWs(next[0].id);
   };
 
